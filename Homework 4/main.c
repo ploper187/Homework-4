@@ -26,6 +26,7 @@
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 32
 #define MAX_USERNAME_LEN 16
+#define MIN_USERNAME_LEN 4
 
 /*
  a multi-threaded chat server using sockets.
@@ -133,6 +134,14 @@ User* makeUDPUser(const int sd, saddrin*client) {
   return makeUser(sd, client, UDP_CONN);
 }
 
+int num_users = 0;
+int isChildThread() {
+  return pthread_self() != pthread_main; 
+}
+int isMainThread() {
+  return !isChildThread();
+}
+
 int sameClient(User * l, User * r) {
   return inet_ntoa(l->client->sin_addr) == inet_ntoa(r->client->sin_addr)
   && ntohs(l->client->sin_port) == ntohs(r->client->sin_port);
@@ -143,23 +152,15 @@ int sameUserID(User * l, User * r) {
 int compareUsersLexicographically(const void *l, const void *r) {
   User * lu = (User*) l;
   User * ru = (User*) r;
-  return strcmp(lu->user_id, ru->user_id);
+  return (lu && ru) && (lu->user_id && ru->user_id) && strcmp(lu->user_id, ru->user_id);
 }
 ssize_t sendUser(User * user, char* message) {
-  return sendto(user->fd, message, strlen(message), 0, (saddr*)&user->client, user->client_size);
+  ssize_t rc = sendto(user->fd, message, strlen(message), 0, (saddr*)&user->client, user->client_size);
+  return rc;
 }
+
 pthread_mutex_t user_mutex = PTHREAD_MUTEX_INITIALIZER;
 User** users;
-
-
-int num_users = 0;
-int isChildThread() {
-  return pthread_self() != pthread_main; 
-}
-int isMainThread() {
-  return !isChildThread();
-}
-
 
 enum Request{LOGIN, WHO, LOGOUT, SEND, BROADCAST, SHARE, NONE};
 
@@ -174,64 +175,20 @@ enum Request requestType(User* user) {
   return NONE;
 }
 
-// LOGIN WHO LOGOUT SEND BROADCAST SHARE
-
-
-//int start_tcp_server(const int port) {
-//  const int tcp_sd = socket( PF_INET, SOCK_DGRAM, 0 ); // UDP
-//  if ( tcp_sd == -1 ) 
-//    perror( "TCP socket() failed" );
-////  printf( "MAIN: Listening for TCP connections on port: %d\n", port );
-//  return tcp_sd;
-//}
-//
-//int start_udp_server(saddrin * server, const int port) {
-//  const int udp_sd = socket( AF_INET, SOCK_DGRAM, 0 ); // UDP
-//  if ( udp_sd == -1 ) {
-//    perror( "UDP socket() failed" );
-//    return -1;
-//  }
-// 
-//  server->sin_family = AF_INET;  /* AF_INET */
-//  server->sin_addr.s_addr = htonl( INADDR_ANY );
-//  server->sin_port = htons( port );
-//  if ( bind( udp_sd, (struct sockaddr *)server, sizeof( *server ) ) < 0 ) {
-//    perror( "UDP bind() failed" );
-//    return -1;
-//  }
-//  int length = sizeof( *server );
-//  
-//  /* call getsockname() to obtain the port number that was just assigned */
-//  if ( getsockname( udp_sd, (struct sockaddr *) server, (socklen_t *) &length ) < 0 ) {
-//    perror( "UDP getsockname() failed" );
-//    return -1;
-//  }
-//  return udp_sd;
-//}
-//int initialize_servers(const int port) {
-////  int udp_sd;  /* socket descriptor -- this is actually in the fd table! */
-////  int tcp_sd;  /* socket descriptor -- this is actually in the fd table! */
-//  printf("MAIN: Started server\n");
-//  int tcp_sd = start_tcp_server(port); 
-//  struct sockaddr_in udp_server;
-//  int udp_sd = start_udp_server(&udp_server, port);
-//  printf( "MAIN: Listening for TCP connections on port: %d\n", port );
-//  printf( "MAIN: Listening for UDP datagrams on port: %d\n", ntohs( udp_server.sin_port ) );
-//
-//
-//  
-//  while (FOREVER_LOOP) {
-//    break;
-//  }
-//  close(tcp_sd);
-//  close(udp_sd);
-//  return EXIT_SUCCESS;
-//}
-
 int setup_udp(saddrin* server, const int port) {
+  struct timeval to;
+  to.tv_sec = 3;
+  to.tv_usec = 500;
   int udp_sd = socket(AF_INET, SOCK_DGRAM, 0); 
   if (udp_sd < 0) {
     perror( "MAIN: ERROR socket() failed" );
+    return -1;
+  }
+  server->sin_family = AF_INET;
+  server->sin_addr.s_addr = htonl(INADDR_ANY);
+  server->sin_port = htons(port);
+  if (setsockopt(udp_sd, SOL_SOCKET, SO_REUSEADDR, &to, sizeof(to)) < 0) {
+    perror("MAIN: ERROR setsockopt() failed");
     return -1;
   }
   if ( bind( udp_sd, (const saddr *) server, sizeof( *server ) ) < 0 ) {
@@ -266,7 +223,6 @@ int setup_tcp(saddrin* server, const int port) {
     return -1;
   }
   printf("MAIN: Listening for TCP connections on port: %d\n", port);
-
   return tcp_sd;
 }
 
@@ -288,6 +244,10 @@ int authenticate(User * user) {
 }
 
 int handle_who(User * user) {
+  if (isMainThread())
+    printf("MAIN: Rcvd WHO request\n");
+  else 
+    printf("CHILD %d: Rcvd WHO request\n", (int)pthread_self());
   char buffer[BUFFER_SIZE];
   memset(&buffer[0], 0, BUFFER_SIZE);
   strcat(buffer, "OK!\n");
@@ -301,26 +261,35 @@ int handle_who(User * user) {
   sendUser(user, buffer);
   return 0==0;
 }
-
-int handle_logout(User * user) {
-  // Remove user from group
-  // Realloc, copy over nonnull users
+int handle_logout_silent(User* user) {
   int prev_num_users = num_users;
   pthread_mutex_lock(&user_mutex);
   for (int i = 0; num_users > 0 && i < MAX_CLIENTS; i++) {
     User * curr = users[i];
     if (curr == NULL) 
       continue;
-    else if (sameClient(user, curr)) {
+    else if (sameUserID(user, curr)) {
       users[i] = users[num_users-1];
       users[num_users-1] = NULL;
       num_users--;
     }
   }
   pthread_mutex_unlock(&user_mutex);
-  sendUser(user, "OK!\n");
   return num_users == prev_num_users;
 }
+int handle_logout(User * user) {
+  if (isMainThread())
+    printf("MAIN: Rcvd LOGOUT request\n");
+  else 
+    printf("CHILD %d: Rcvd LOGOUT request\n", (int)pthread_self());
+  // Remove user from group
+  // Realloc, copy over nonnull users
+  int success = handle_logout_silent(user);
+  sendUser(user, "OK!\n");
+  return success;
+}
+
+
 typedef struct Message {
   User * recipient;
   User * sender;
@@ -333,7 +302,7 @@ Message * createMessage(User * user) {
   // Walk through the buffer from 5 onwards
   //  int valid = 0==0;
   int reqLen = (int)strlen(user->buffer);
-  int loginLen = 0;;
+  int loginLen = 0;
   for (loginLen = 0; loginLen < reqLen && isalpha(user->buffer[loginLen]); loginLen++) {}
   loginLen++;
   int i = 0;
@@ -343,11 +312,16 @@ Message * createMessage(User * user) {
   char number[4];
   memset(number, 0, 4);
   //  int user_id_len = i - loginLen;
-  int num_start = ++i;
-  for (; i < reqLen && isnumber(user->buffer[i]); i++)
+  int num_start = i + (isdigit(user->buffer[i]) ? 0 : 1);
+  for (i = num_start; i < reqLen && isdigit(user->buffer[i]); i++)
     number[i-num_start] = user->buffer[i];
   int msg_len = atoi(number);
+  if (!user->user_id) {
+    printf("ERROR not logged in!");
+    return NULL;
+  }
   if (msg_len < 1 || msg_len > 990) {
+    printf("Message number %s\n", number);
     sendUser(user, "ERROR Invalid msglen\n");
     return NULL;
   }
@@ -358,7 +332,7 @@ Message * createMessage(User * user) {
   char * msg = calloc(BUFFER_SIZE, sizeof(char));
   memset(msg, 0, BUFFER_SIZE);
   strcat(msg, "FROM ");
-  strcat(msg, user->user_id);
+  strcat(msg, user->connection_type == TCP_CONN ? user->user_id : "UDP-Client");
   strcat(msg, " ");
   strcat(msg, number);
   strcat(msg, " ");
@@ -370,6 +344,8 @@ Message * createMessage(User * user) {
     else if (strcmp(users[u]->user_id, name_buff) == 0) 
       recipient = users[u];
   }
+  if (!recipient) 
+    return NULL;
   Message * m = calloc(1, sizeof(Message));
   m->sender = user;
   m->recipient = recipient; 
@@ -378,64 +354,70 @@ Message * createMessage(User * user) {
 }
 
 int handle_send(User * user) {
-  if (!authenticate(user)) {
-    sendUser(user, "Not logged in!!!\n");
-    return 0==1;
-  }
   Message* m = createMessage(user);
   
-  if (m && m->recipient == NULL) sendUser(user, "ERROR Unknown userid");
-  else if (m)                    sendUser(m->recipient, m->text);
-  free(m->text);
+//  Rcvd SEND request to userid Rick
+  if (isMainThread() && m)
+    printf("MAIN: Rcvd SEND request to userid %s\n", m->recipient->user_id);
+  else if (m) 
+    printf("CHILD %d: Rcvd SEND request to userid %s\n", (int)pthread_self(), m->recipient->user_id);
+  if (m && m->recipient == NULL) {
+    sendUser(user, "ERROR Unknown userid");
+  
+  }
+  else if (m) {
+    sendUser(user, "OK!\n");
+    sendUser(m->recipient, m->text);
+  }
   free(m);
-  
-  
   return 0==1;
 }
 
 int handle_broadcast(User * user) {
+  if (isMainThread())
+    printf("MAIN: Rcvd BROADCAST request\n");
+  else 
+    printf("CHILD %d: Rcvd BROADCAST request\n", (int)pthread_self());
   Message* m = createMessage(user);
-  for (int i = 0; i < MAX_CLIENTS; i++) {
-    if (users[i] != NULL) 
-      sendUser(users[i], m->text);
+  
+  for (int i = 0; m && i < MAX_CLIENTS; i++) {
+    if (users[i]) sendUser(users[i], m->text);
   }
   free(m);
   return 0==1;
 }
 int handle_share(User * user) {
+  
   return 0==1; 
 }
 
 
 int handle_login(User * user) {
-  if (authenticate(user)) {
-    sendUser(user, "ERROR Already connected\n");
-    return 0==1;
-  }
   char name_buff[MAX_USERNAME_LEN+1];
   memset(name_buff, 0, MAX_USERNAME_LEN+1);
-  // Walk through the buffer from 5 onwards
-  int valid = 0==0;
+  int isValid = 0==0;
   int loginLen = (int)strlen("LOGIN ");
   int requestLength = (int)strlen(user->buffer);
   int i = 0;
-  for (i = loginLen; i < requestLength; i++) {
+  for (i = loginLen; isValid && i < requestLength; i++) {
     char curr = user->buffer[i];
     /* a valid <userid> alphanumeric characters size [4,16].
      if <userid> is invalid, the server responds with an <error-message> of
      “Invalid userid” (do not close)
      Non zero number  If the parameter is an alphabet.  */
-    if (i - loginLen >= MAX_USERNAME_LEN) {
-      valid = curr == '\n';
-      break;
-    }
-    else if (isalpha(curr) != 0) name_buff[i - loginLen] = curr;
+    if (i - loginLen >= MAX_USERNAME_LEN) isValid = curr == '\n';
+    else if (isalpha(curr) != 0 || isdigit(curr) != 0) name_buff[i - loginLen] = curr;
     else if (curr == '\n') break;
-    else valid = 0==1;
+    else isValid = 0==1;
   }
-  if (!valid) {
+  isValid = isValid && (i - loginLen >= MIN_USERNAME_LEN);
+  if (!isValid) {
+    if (isMainThread())
+      printf("MAIN: Sent ERROR (Invalid userid)\n");
+    else 
+      printf("CHILD %d: Sent ERROR (Invalid userid)\n", (int)pthread_self());
+    
     sendUser(user, "ERROR Invalid userid\n");
-    free(name_buff);
     return 0==1;
   } else {
     free(user->user_id);
@@ -451,83 +433,89 @@ int handle_login(User * user) {
   int found = 0==1;
   for (int i = 0; !found && i < num_users; i++) {
     User* aUser = users[i];
-    int clientsEqual = sameClient(user, aUser);
     int userIDsEqual = sameUserID(user, aUser);
-    found = userIDsEqual || clientsEqual;
+    found = userIDsEqual;
   }
   pthread_mutex_unlock(&user_mutex);
-  if (found) sendUser(user, "ERROR Already connected\n");
+  if (found) { 
+    if (isMainThread())
+      printf("MAIN: Sent ERROR (Already connected)\n");
+    else 
+      printf("CHILD %d: Sent ERROR (Already connected)\n", (int)pthread_self());
+    sendUser(user, "ERROR Already connected\n");
+  }
   else if (num_users < MAX_CLIENTS){
     pthread_mutex_lock(&user_mutex);
     users[num_users++] = user;
     pthread_mutex_unlock(&user_mutex);
     sendUser(user, "OK!\n");
-  } else {
+  } else
     sendUser(user, "ERROR Too many users\n");
-  } 
   return 0==0;
 }
-
-
 
 ssize_t readFromUser(User * user) {
   memset(user->buffer, 0, BUFFER_SIZE);
   ssize_t n = read(user->fd, user->buffer, BUFFER_SIZE);
-  printf("Message from TCP client: \"%s\" (size %lu)\n", user->buffer, strlen(user->buffer)); 
   return n;
 }
 
-
-void* handle_tcp_connection(void* argv) {
- 
-  User* user = argv;
-  while (user != NULL && (readFromUser(user)<-1 || FOREVER_LOOP)) 
+void handle_tcp_connection(User * user) {
+  while (user != NULL && readFromUser(user) != 0 && FOREVER_LOOP) 
     switch(requestType(user)) {
-      case LOGIN:
-        handle_login(user);
-        break;
-      case WHO:
-        handle_who(user); 
-        break;
-      case LOGOUT:
-        handle_logout(user);
-        break;
-      case BROADCAST:
-        handle_broadcast(user);
-        break;
-      case SHARE:
-        handle_share(user);
-      case SEND:
-        handle_send(user);
-        break;
-      default:
+      case BROADCAST: handle_broadcast(user); break;
+      case LOGOUT:    handle_logout(user);    break;
+      case SHARE:     handle_share(user);     break;
+      case LOGIN:     handle_login(user);     break;
+      case SEND:      handle_send(user);      break;
+      case WHO:       handle_who(user);       break;
+      default: 
         break;
     }
-  
-  close(user->fd);
-  free(user);
-  pthread_exit(NULL);
-  return NULL;
-  
 }
 
-void* handle_udp_connection(void* argv) {
+void handle_udp_connection(User * user) {
+  switch(requestType(user)) {
+    case BROADCAST: handle_broadcast(user); break;
+    case WHO:       handle_who(user);       break;
+      
+    case LOGIN:  sendUser(user, "LOGIN not supported over UDP");
+      break;
+    case LOGOUT: sendUser(user, "LOGOUT not supported over UDP");     
+      break;
+    case SHARE:  sendUser(user, "SHARE not supported over UDP");
+      break;
+    case SEND:   sendUser(user, "SEND not supported over UDP");
+    break;
+    default:
+      break;
+  }
+}
+
+void* handle_connection(void* argv) {
   User* user = argv;
-  printf("Message from UDP client: %s", user->buffer);
+  switch (user->connection_type) {
+    case TCP_CONN: handle_tcp_connection(user); break;
+    case UDP_CONN: handle_udp_connection(user); break;
+  }
+  if (isMainThread())
+    printf("MAIN: Client disconnected\n");
+  else 
+    printf("CHILD %d: Client disconnected\n", (int)pthread_self());
   pthread_exit(NULL);
   return NULL;
 }
-
 
 int run_server(const int port) {
   printf("MAIN: Started server\n");
   users = calloc(MAX_CLIENTS, sizeof(User));
   num_users = 0;
-  int max_sd; 
   socklen_t l; 
   saddrin* client = calloc(1, sizeof(saddrin));
   saddrin* server = calloc(1, sizeof(saddrin));
-  void sig_chld(int); 
+  struct timeval to;
+  to.tv_sec = 3;
+  to.tv_usec = 500;
   int tcp_sd = setup_tcp(server, port), udp_sd = setup_udp(server, port);
   if (tcp_sd < 0 || udp_sd < 0) return EXIT_FAILURE; 
   // clear the descriptor set 
@@ -536,9 +524,8 @@ int run_server(const int port) {
     FD_ZERO(&fds);
     FD_SET(udp_sd, &fds);
     FD_SET(tcp_sd, &fds);
-    max_sd = (tcp_sd > udp_sd ? tcp_sd : udp_sd) + 1; 
-    if (select(max_sd, &fds, NULL, NULL, NULL) == 0) continue;
-    
+    if (select(FD_SETSIZE, &fds, NULL, NULL, &to) == 0) continue;
+  
     // TCP //////////////////////
     if (FD_ISSET(tcp_sd, &fds)) { 
       l = sizeof(client); 
@@ -546,38 +533,25 @@ int run_server(const int port) {
       user->fd = accept(tcp_sd, (saddr*)client, &l);
       printf("MAIN: Rcvd incoming TCP connection from: %s\n",
              inet_ntoa((struct in_addr)client->sin_addr));
-      pthread_create(&user->pid, NULL, handle_tcp_connection, user);
+      pthread_create(&user->pid, NULL, handle_connection, user);
     } 
     
     // UDP //////////////////////
     if (FD_ISSET(udp_sd, &fds)) { 
       socklen_t l = sizeof(client);
       User* user = makeUDPUser(udp_sd, client);
-      
+      user->fd = udp_sd;
       ssize_t received = recvfrom(udp_sd, user->buffer, BUFFER_SIZE,0, (saddr*)client, (socklen_t*)&l);
-      if (received < 0) { 
+      if (received < 0)  
         perror("MAIN: ERROR recvfrom() failed");
-      }
       else {
-        printf("MAIN: Rcvd incoming UDP datagram from: %s\n", inet_ntoa(client->sin_addr));
-//        user->buffer[BUFFER_SIZE] = '\0';
-//        handle_udp_connection(user);
-
+        printf("MAIN: Rcvd incoming UDP datagram from: %s\n", 
+               inet_ntoa(client->sin_addr));
+        user->buffer[BUFFER_SIZE] = '\0';
+        handle_connection(user);
       }
       free(user);
-
-//      FD_SET(udp_sd, &fds);
-//      bzero(buffer, sizeof(buffer)); 
-//      
-//      printf("\nMessage from UDP client: "); 
-//      n = recvfrom(udp_sd, buffer, sizeof(buffer), 0, 
-//                   (struct sockaddr*)&client, &len); 
-//      puts(buffer); 
-//      sendto(udpfd, (const char*)message, sizeof(buffer), 0, 
-//             (struct sockaddr*)&cliaddr, sizeof(cliaddr)); 
-    }
-    FD_ZERO(&fds); 
-
+    } 
   }
   return EXIT_SUCCESS;
 }
@@ -585,6 +559,7 @@ int run_server(const int port) {
 
 
 int main(int argc, const char * argv[]) {
+  setvbuf( stdout, NULL, _IONBF, 0 );
   pthread_main = pthread_self();
   // insert code here...
   // argv[0] port number 
