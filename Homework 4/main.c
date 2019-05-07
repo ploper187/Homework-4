@@ -107,14 +107,14 @@ typedef struct sockaddr saddr;
 
 typedef struct User {
   int sd;
+  
   int fd;
   pthread_t pid;
   char * buffer;
   saddrin* client;
   socklen_t client_size;
-  char * user_id;
-  int connection_type;
-  
+  char * id;
+  int conn_type;
 } User;
 
 User* makeUser(const int sd, saddrin* client, const int conn_type) {
@@ -123,7 +123,7 @@ User* makeUser(const int sd, saddrin* client, const int conn_type) {
   user->pid = pthread_main;
   user->client = client;
   user->client_size = sizeof(*client);
-  user->connection_type = conn_type;
+  user->conn_type = conn_type;
   user->buffer = calloc(BUFFER_SIZE+1, sizeof(char));
   return user;
 }
@@ -147,16 +147,21 @@ int sameClient(User * l, User * r) {
   && ntohs(l->client->sin_port) == ntohs(r->client->sin_port);
 }
 int sameUserID(User * l, User * r) {
-  return l->user_id != NULL && r->user_id != NULL && strcmp(l->user_id, r->user_id) == 0; 
+  return l->id != NULL && r->id != NULL && strcmp(l->id, r->id) == 0; 
 }
 int compareUsersLexicographically(const void *l, const void *r) {
   User * lu = (User*) l;
   User * ru = (User*) r;
-  return (lu && ru) && (lu->user_id && ru->user_id) && strcmp(lu->user_id, ru->user_id);
+  return (lu && ru) && (lu->id && ru->id) && strcmp(lu->id, ru->id);
 }
 ssize_t sendUser(User * user, char* message) {
   ssize_t rc = sendto(user->fd, message, strlen(message), 0, (saddr*)&user->client, user->client_size);
   return rc;
+}
+ssize_t readFromUser(User * user) {
+  memset(user->buffer, 0, BUFFER_SIZE);
+  ssize_t n = read(user->fd, user->buffer, BUFFER_SIZE);
+  return n;
 }
 
 pthread_mutex_t user_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -254,7 +259,7 @@ int handle_who(User * user) {
   pthread_mutex_lock(&user_mutex);
   qsort(users, num_users, sizeof(User), compareUsersLexicographically);
   for (int i = 0; i < num_users; i++) {
-    strcat(buffer, users[i]->user_id);
+    strcat(buffer, users[i]->id);
     strcat(buffer, "\n");
   }
   pthread_mutex_unlock(&user_mutex);
@@ -293,7 +298,9 @@ int handle_logout(User * user) {
 typedef struct Message {
   User * recipient;
   User * sender;
+  char * to_id;
   char * text;
+  int text_len;
 } Message;
 
 Message * createMessage(User * user) {
@@ -303,10 +310,14 @@ Message * createMessage(User * user) {
   //  int valid = 0==0;
   int reqLen = (int)strlen(user->buffer);
   int loginLen = 0;
-  for (loginLen = 0; loginLen < reqLen && isalpha(user->buffer[loginLen]); loginLen++) {}
+  for (loginLen = 0; \
+       loginLen < reqLen && isalpha(user->buffer[loginLen]); \
+       loginLen++) {}
   loginLen++;
   int i = 0;
-  for (i = loginLen; requestType(user) == SEND &&  i < reqLen && isalpha(user->buffer[i]); i++) 
+  for (i = loginLen; \
+       requestType(user) == SEND &&  i < reqLen && isalpha(user->buffer[i]);\
+       i++) 
     // Copy the name over to the name buff;
     name_buff[i-loginLen] = user->buffer[i]; 
   char number[4];
@@ -316,7 +327,7 @@ Message * createMessage(User * user) {
   for (i = num_start; i < reqLen && isdigit(user->buffer[i]); i++)
     number[i-num_start] = user->buffer[i];
   int msg_len = atoi(number);
-  if (!user->user_id) {
+  if (!user->id) {
     printf("ERROR not logged in!");
     return NULL;
   }
@@ -327,12 +338,15 @@ Message * createMessage(User * user) {
   }
   
   int msg_start = i + 1;
-  user->buffer[msg_start + msg_len] = '\0';
+  if (msg_len + msg_start < reqLen)
+    user->buffer[msg_start + msg_len] = '\0';
+  else 
+    user->buffer[reqLen - 1] = '\0';
   // FROM <sender-userid> <msglen> <message>\n
   char * msg = calloc(BUFFER_SIZE, sizeof(char));
   memset(msg, 0, BUFFER_SIZE);
   strcat(msg, "FROM ");
-  strcat(msg, user->connection_type == TCP_CONN ? user->user_id : "UDP-Client");
+  strcat(msg, user->conn_type == TCP_CONN ? user->id : "UDP-Client");
   strcat(msg, " ");
   strcat(msg, number);
   strcat(msg, " ");
@@ -341,29 +355,28 @@ Message * createMessage(User * user) {
   User* recipient = NULL;
   for (int u = 0; u < MAX_CLIENTS; u++) {
     if (users[u] == NULL) continue;
-    else if (strcmp(users[u]->user_id, name_buff) == 0) 
+    else if (strcmp(users[u]->id, name_buff) == 0) 
       recipient = users[u];
   }
-  if (!recipient) 
-    return NULL;
   Message * m = calloc(1, sizeof(Message));
+  m->to_id = calloc(strlen(name_buff) + 1, sizeof(char));
+  strcpy(m->to_id, name_buff);
   m->sender = user;
   m->recipient = recipient; 
   m->text = msg;
+  m->text_len = msg_len;
   return m;
 }
 
 int handle_send(User * user) {
   Message* m = createMessage(user);
   
-//  Rcvd SEND request to userid Rick
-  if (isMainThread() && m)
-    printf("MAIN: Rcvd SEND request to userid %s\n", m->recipient->user_id);
+  if (isMainThread())
+    printf("MAIN: Rcvd SEND request to userid %s\n", m->to_id);
   else if (m) 
-    printf("CHILD %d: Rcvd SEND request to userid %s\n", (int)pthread_self(), m->recipient->user_id);
+    printf("CHILD %d: Rcvd SEND request to userid %s\n", (int)pthread_self(), m->to_id);
   if (m && m->recipient == NULL) {
     sendUser(user, "ERROR Unknown userid");
-  
   }
   else if (m) {
     sendUser(user, "OK!\n");
@@ -380,14 +393,46 @@ int handle_broadcast(User * user) {
     printf("CHILD %d: Rcvd BROADCAST request\n", (int)pthread_self());
   Message* m = createMessage(user);
   
-  for (int i = 0; m && i < MAX_CLIENTS; i++) {
-    if (users[i]) sendUser(users[i], m->text);
-  }
+  for (int i = 0; m && i < MAX_CLIENTS; i++) 
+    if (users[i]) 
+      sendUser(users[i], m->text);
+  
   free(m);
   return 0==1;
 }
+// SHARE <recipient-userid> <filelen>\n
 int handle_share(User * user) {
+  if (isMainThread())
+    printf("MAIN: Rcvd SHARE request\n");
+  else 
+    printf("CHILD %d: Rcvd SHARE request\n", (int)pthread_self());
+  Message * m = createMessage(user);
+  if (!(m->recipient && m->sender && m->sender)) 
+    return 0==1; 
   
+  // OK!\n
+  sendUser(user, "OK!\n");
+  // SHARE <sender-userid> <filelen>\n
+  char recipient_response[BUFFER_SIZE];
+  char number[4];
+  sprintf(number, "%d", m->text_len);
+  memset(&recipient_response, 0, BUFFER_SIZE);
+  strcat(recipient_response, "SHARE ");
+  strcat(recipient_response, user->id);
+  strcat(recipient_response, " ");
+  strcat(recipient_response,number);
+  strcat(recipient_response, "\n");
+  sendUser(m->recipient, recipient_response);
+  
+  int chars_left = m->text_len;
+  while (chars_left > 0) {
+    ssize_t n = readFromUser(user);
+    if (n == BUFFER_SIZE || chars_left == n) {
+      sendUser(m->recipient, user->buffer);
+    } else
+      break;
+    chars_left -= n;
+  }
   return 0==1; 
 }
 
@@ -416,18 +461,17 @@ int handle_login(User * user) {
       printf("MAIN: Sent ERROR (Invalid userid)\n");
     else 
       printf("CHILD %d: Sent ERROR (Invalid userid)\n", (int)pthread_self());
-    
     sendUser(user, "ERROR Invalid userid\n");
     return 0==1;
   } else {
-    free(user->user_id);
-    user->user_id = calloc(i-loginLen+1, sizeof(char));
-    strcpy(user->user_id, name_buff);
+    free(user->id);
+    user->id = calloc(i-loginLen+1, sizeof(char));
+    strcpy(user->id, name_buff);
   }
   if (isMainThread())
-    printf("MAIN: Rcvd LOGIN request for userid %s\n", user->user_id);
+    printf("MAIN: Rcvd LOGIN request for userid %s\n", user->id);
   else 
-    printf("CHILD %d: Rcvd LOGIN request for userid %s\n", (int)pthread_self(), user->user_id);
+    printf("CHILD %d: Rcvd LOGIN request for userid %s\n", (int)pthread_self(), user->id);
   
   pthread_mutex_lock(&user_mutex);
   int found = 0==1;
@@ -454,11 +498,7 @@ int handle_login(User * user) {
   return 0==0;
 }
 
-ssize_t readFromUser(User * user) {
-  memset(user->buffer, 0, BUFFER_SIZE);
-  ssize_t n = read(user->fd, user->buffer, BUFFER_SIZE);
-  return n;
-}
+
 
 void handle_tcp_connection(User * user) {
   while (user != NULL && readFromUser(user) != 0 && FOREVER_LOOP) 
@@ -494,7 +534,7 @@ void handle_udp_connection(User * user) {
 
 void* handle_connection(void* argv) {
   User* user = argv;
-  switch (user->connection_type) {
+  switch (user->conn_type) {
     case TCP_CONN: handle_tcp_connection(user); break;
     case UDP_CONN: handle_udp_connection(user); break;
   }
